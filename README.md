@@ -23,6 +23,10 @@ go run ./cmd/paleo-prep-station --addr 127.0.0.1:18133
 
 服务启动后，`GET /healthz` 返回就绪状态。
 
+加上 `--data-dir <目录>` 后，所有已经确认成功的变更都会写入该目录下的
+`journal.log` 并同步落盘，重启服务后恢复同一工作区；写入过程被打断只会丢弃
+那一次未确认的记录，之前和之后的确认数据不受影响。
+
 ## 主要接口
 
 - `GET /specimens` 与 `POST /specimens`
@@ -45,6 +49,16 @@ go run ./cmd/workflowcheck --workflow release-for-study
 ```
 
 这些检查会启动临时 HTTP 处理器并调用真实公共路由。
+
+持久化重启链路的本地验证：
+
+```bash
+go run ./cmd/durablecheck
+```
+
+该检查通过公共服务 API 完成完整业务链路，并在两次真实重启后核对标本详情、
+方案快照、进度序列和放行记录；另外会人为截断日志末尾，模拟写入过程中被打断
+的场景，验证被打断的记录不会牵连之前或之后已经确认的数据。
 
 ## 环境变量
 

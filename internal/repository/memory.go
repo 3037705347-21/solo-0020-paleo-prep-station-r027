@@ -66,19 +66,50 @@ func Open(dir string) (*MemoryRepository, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, journalFileName)
+	_, statErr := os.Stat(path)
+	journalMissing := errors.Is(statErr, os.ErrNotExist)
+	if statErr != nil && !journalMissing {
+		return nil, statErr
+	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
+	}
+	if journalMissing {
+		// Make the freshly created journal entry visible on disk; otherwise a
+		// crash immediately after startup could leave the directory without the
+		// file even though records were synced into it.
+		if err := syncDir(dir); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
 	}
 	repo := &MemoryRepository{
 		state:       emptyState(),
 		journal:     file,
 		journalPath: path,
 	}
-	records, _, err := readJournal(file)
+	records, validBytes, err := readJournal(file)
 	if err != nil {
 		_ = file.Close()
 		return nil, err
+	}
+	// A crash mid-append leaves a truncated record tail that fails the magic,
+	// length or checksum checks. Drop only that incomplete tail so it cannot
+	// block records committed afterwards, while every complete record before
+	// it stays intact.
+	if size, err := file.Seek(0, io.SeekEnd); err != nil {
+		_ = file.Close()
+		return nil, err
+	} else if size != validBytes {
+		if err := file.Truncate(validBytes); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
 	}
 	if len(records) > 0 {
 		last := records[len(records)-1]
@@ -190,25 +221,44 @@ func recordFrom(source state, seq uint64) commitRecord {
 	return record
 }
 
-func (r *MemoryRepository) appendRecord(record commitRecord) error {
+func (r *MemoryRepository) appendRecord(record commitRecord) (err error) {
 	payload, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
-	header := make([]byte, journalHeaderLen)
-	binary.BigEndian.PutUint32(header[0:4], journalMagic)
-	binary.BigEndian.PutUint32(header[4:8], uint32(len(payload)))
-	binary.BigEndian.PutUint32(header[8:12], crc32.ChecksumIEEE(payload))
-	if _, err := r.journal.Seek(0, io.SeekEnd); err != nil {
+	buffer := make([]byte, journalHeaderLen+len(payload))
+	binary.BigEndian.PutUint32(buffer[0:4], journalMagic)
+	binary.BigEndian.PutUint32(buffer[4:8], uint32(len(payload)))
+	binary.BigEndian.PutUint32(buffer[8:12], crc32.ChecksumIEEE(payload))
+	copy(buffer[journalHeaderLen:], payload)
+	// One contiguous append keeps header and payload from interleaving; the
+	// checksum still rejects a record torn short by a crash during the write.
+	start, err := r.journal.Seek(0, io.SeekEnd)
+	if err != nil {
 		return err
 	}
-	if _, err := r.journal.Write(header); err != nil {
+	if _, err = r.journal.Write(buffer); err != nil {
+		r.discardTail(start)
 		return err
 	}
-	if _, err := r.journal.Write(payload); err != nil {
+	if err = r.journal.Sync(); err != nil {
+		// The bytes may or may not be on disk, but the caller never received an
+		// acknowledgement, so roll the journal back to the last known-good
+		// boundary instead of letting later commits pile up behind a torn tail.
+		r.discardTail(start)
 		return err
 	}
-	return r.journal.Sync()
+	return nil
+}
+
+// discardTail best-effort rewinds the journal to offset so a failed append
+// cannot poison records committed afterwards.
+func (r *MemoryRepository) discardTail(offset int64) {
+	if r.journal == nil {
+		return
+	}
+	_ = r.journal.Truncate(offset)
+	_, _ = r.journal.Seek(offset, io.SeekStart)
 }
 
 func (r *MemoryRepository) Read(fn func(*Mutation) error) error {
@@ -226,7 +276,11 @@ func (r *MemoryRepository) Mutate(fn func(*Mutation) error) error {
 		return err
 	}
 	if r.journal != nil {
-		record := recordFrom(r.state, r.commitSeq+1)
+		// Record the post-mutation snapshot: durability must capture exactly
+		// what the caller is about to see acknowledged. The append and its
+		// sync complete before the in-memory state is published, so an
+		// acknowledged change always has a durable record behind it.
+		record := recordFrom(tx.state, r.commitSeq+1)
 		if err := r.appendRecord(record); err != nil {
 			return err
 		}
@@ -373,4 +427,14 @@ func (m *Mutation) ReleaseForSpecimen(specimenID string) (domain.ReleaseRecord, 
 
 func (m *Mutation) PutRelease(value domain.ReleaseRecord) {
 	m.state.releases[value.ID] = value
+}
+
+// syncDir flushes a directory so a newly created journal entry is durable.
+func syncDir(dir string) error {
+	handle, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+	return handle.Sync()
 }
