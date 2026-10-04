@@ -34,6 +34,7 @@ type MemoryRepository struct {
 	commitSeq   uint64
 	journal     *os.File
 	journalPath string
+	journalEnd  int64
 }
 
 func NewMemory() *MemoryRepository {
@@ -75,7 +76,7 @@ func Open(dir string) (*MemoryRepository, error) {
 		journal:     file,
 		journalPath: path,
 	}
-	records, _, err := readJournal(file)
+	records, offset, err := readJournal(file)
 	if err != nil {
 		_ = file.Close()
 		return nil, err
@@ -85,10 +86,17 @@ func Open(dir string) (*MemoryRepository, error) {
 		repo.state = last.toState()
 		repo.commitSeq = last.Seq
 	}
-	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+	// Drop any torn tail left by an interrupted write, so future commits
+	// append directly after the last complete record and stay replayable.
+	if err := file.Truncate(offset); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	repo.journalEnd = offset
 	return repo, nil
 }
 
@@ -199,16 +207,33 @@ func (r *MemoryRepository) appendRecord(record commitRecord) error {
 	binary.BigEndian.PutUint32(header[0:4], journalMagic)
 	binary.BigEndian.PutUint32(header[4:8], uint32(len(payload)))
 	binary.BigEndian.PutUint32(header[8:12], crc32.ChecksumIEEE(payload))
-	if _, err := r.journal.Seek(0, io.SeekEnd); err != nil {
+	if _, err := r.journal.Seek(r.journalEnd, io.SeekStart); err != nil {
 		return err
 	}
 	if _, err := r.journal.Write(header); err != nil {
+		r.discardPartialRecord()
 		return err
 	}
 	if _, err := r.journal.Write(payload); err != nil {
+		r.discardPartialRecord()
 		return err
 	}
-	return r.journal.Sync()
+	if err := r.journal.Sync(); err != nil {
+		r.discardPartialRecord()
+		return err
+	}
+	r.journalEnd += int64(journalHeaderLen + len(payload))
+	return nil
+}
+
+// discardPartialRecord rolls the journal back to the last complete record
+// after an interrupted append, so later commits are not stranded behind an
+// unreadable tail. Best effort: recovery truncates the tail again on open.
+func (r *MemoryRepository) discardPartialRecord() {
+	if err := r.journal.Truncate(r.journalEnd); err != nil {
+		return
+	}
+	_, _ = r.journal.Seek(r.journalEnd, io.SeekStart)
 }
 
 func (r *MemoryRepository) Read(fn func(*Mutation) error) error {
@@ -225,14 +250,18 @@ func (r *MemoryRepository) Mutate(fn func(*Mutation) error) error {
 	if err := fn(tx); err != nil {
 		return err
 	}
+	next := tx.snapshot()
 	if r.journal != nil {
-		record := recordFrom(r.state, r.commitSeq+1)
+		// Persist the state produced by this commit, not the state it
+		// replaces; otherwise the newest confirmed mutation is missing
+		// after a restart.
+		record := recordFrom(next, r.commitSeq+1)
 		if err := r.appendRecord(record); err != nil {
 			return err
 		}
 	}
 	r.commitSeq++
-	r.state = tx.snapshot()
+	r.state = next
 	return nil
 }
 
